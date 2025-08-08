@@ -1,28 +1,27 @@
 import os
-import uuid
+import time
 import datetime
-from google import genai
+import uuid
 from dotenv import load_dotenv
-from google.cloud import aiplatform
+from google import genai
+from google.genai import types
 
 # Load environment variables from .env file
 load_dotenv()
 
 # --- Configuration ---
 PROJECT_ID = os.getenv("PROJECT_ID")
+if not PROJECT_ID:
+    raise ValueError("PROJECT_ID environment variable not set.")
 LOCATION = "us-central1"
 PROMPT_FILE = "prompt.txt"
 VIDEO_FOLDER = "videos"
-MODEL=os.getenv("MODEL")
-MODEL_NAME = f"projects/{PROJECT_ID}/locations/{LOCATION}/publishers/google/models/{MODEL}"
-VIDEO_LENGTH = "8s"
+MODEL = os.getenv("MODEL")  # e.g., "veo-3.0-generate-001"
+VIDEO_LENGTH_SECONDS = 8
 ASPECT_RATIO = "9:16"
 
-# Initialize the Vertex AI client
-aiplatform.init(
-    project=PROJECT_ID,
-    location=LOCATION
-)
+# Initialize the Google Gen AI client
+client = genai.Client(vertexai=True, project=PROJECT_ID, location=LOCATION)
 
 def load_prompt_from_file(file_path):
     """Reads and returns the content of a text file."""
@@ -34,35 +33,41 @@ def load_prompt_from_file(file_path):
         return None
 
 def generate_video(prompt):
-    """Generates a video using Vertex AI with a given prompt."""
+    """Generates a video using the Google Gen AI SDK for Python."""
     print("Generating video...")
     if not prompt:
+        print("Prompt is empty. Aborting video generation.")
         return None
 
-    generation_config = {
-        "prompt": prompt,
-        "aspectRatio": ASPECT_RATIO,
-        "videoLength": VIDEO_LENGTH,
-    }
-
     try:
-        client = aiplatform.gapic.PredictionServiceClient(
-            client_options={"api_endpoint": f"{LOCATION}-aiplatform.googleapis.com"}
-        )
-
-        instances = [generation_config]
-
-        response = client.predict(
-            endpoint=MODEL_NAME,
-            instances=instances
+        # Launch long-running generation job
+        operation = client.models.generate_videos(
+            model=MODEL,
+            prompt=prompt,
+            config=types.GenerateVideosConfig(
+                aspect_ratio=ASPECT_RATIO,
+                duration_seconds=VIDEO_LENGTH_SECONDS,
+                number_of_videos=1,
+            ),
         )
         
-        if response.predictions:
-            print("Video generation started. Waiting for operation to complete...")
-            # The response contains a unique operation ID to track the job.
-            return response.predictions[0]["operation"]
+        operation_name = operation if isinstance(operation, str) else operation.name
+        print(f"Video generation operation started. Check your progress with: gcloud alpha ai operations describe {operation_name}")
+        start_time = time.time()
+
+        # Poll until completion
+        while not operation.done:
+            time.sleep(15)
+            operation = client.operations.get(operation)
+            print(operation)
+
+        if operation.response:
+                # The generated videos are in operation.result.generated_videos.
+                # We are generating one video, so we get the first one.
+                # We need to return the video bytes to the save_video function.
+                return operation.result.generated_videos[0].video.video_bytes
         else:
-            print("No video generation predictions were returned.")
+            print("Video generation failed to return a response.")
             return None
 
     except Exception as e:
@@ -70,38 +75,27 @@ def generate_video(prompt):
         return None
 
 
-def get_video_from_operation(operation_name):
-    """Fetches the generated video from the completed operation."""
-    try:
-        operation = aiplatform.gapic.Operation(name=operation_name)
-        # This polls the operation until it's done.
-        video_response = operation.wait(timeout=600)
-        return video_response
-    except Exception as e:
-        print(f"An error occurred while waiting for the video operation: {e}")
-        return None
-
-
-def save_video(response, folder_path):
+def save_video(video_bytes, folder_path):
     """Saves the generated video to a file with a unique name."""
-    if not response or not response.generated_videos:
-        print("Video generation failed. No videos were returned.")
-        return
+    try:
+        if not video_bytes:
+            print("Video generation failed. No video bytes returned.")
+            return
 
-    # Ensure the target folder exists
-    os.makedirs(folder_path, exist_ok=True)
-    
-    generated_video_bytes = response.generated_videos[0].video.bytes
-    
-    # Generate a unique filename using a timestamp and UUID
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    unique_id = str(uuid.uuid4())[:8]
-    video_file_name = f"portrait_video_{timestamp}_{unique_id}.mp4"
-    file_path = os.path.join(folder_path, video_file_name)
+        # Ensure the target folder exists
+        os.makedirs(folder_path, exist_ok=True)
 
-    with open(file_path, "wb") as f:
-        f.write(generated_video_bytes)
-    print(f"Video successfully generated and saved as {file_path}")
+        # Generate a unique filename using a timestamp and UUID
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        unique_id = str(uuid.uuid4())[:8]
+        video_file_name = f"portrait_video_{timestamp}_{unique_id}.mp4"
+        file_path = os.path.join(folder_path, video_file_name)
+
+        with open(file_path, "wb") as f:
+            f.write(video_bytes)
+        print(f"Video successfully generated and saved as {file_path}")
+    except Exception as e:
+        print(f"An error occurred while saving the video: {e}")
 
 def main():
     """Main function to orchestrate the video generation process."""
@@ -109,18 +103,13 @@ def main():
     if not prompt:
         return
 
-    # First, start the video generation job
-    operation_name = generate_video(prompt)
-    if not operation_name:
+    # Start the video generation job and wait for it to complete
+    video_bytes = generate_video(prompt)
+    if not video_bytes:
         return
 
-    # Then, wait for the job to complete and get the video
-    video_response = get_video_from_operation(operation_name)
-    if not video_response:
-        return
-
-    # Finally, save the video
-    save_video(video_response, VIDEO_FOLDER)
+    # Save the video
+    save_video(video_bytes, VIDEO_FOLDER)
 
 if __name__ == "__main__":
     main()
